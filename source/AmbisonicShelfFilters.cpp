@@ -64,10 +64,10 @@ bool CAmbisonicShelfFilters::Configure(unsigned nOrder, bool b3D, unsigned nBloc
     m_nTaps = nbTaps;
 
     //What will the overlap size be?
-    m_nOverlapLength = m_nBlockSize < m_nTaps ? m_nBlockSize - 1 : m_nTaps - 1;
+    m_nOverlapLength = m_nTaps - 1;
     //How large does the FFT need to be
     m_nFFTSize = 1;
-    while(m_nFFTSize < (m_nBlockSize + m_nTaps + m_nOverlapLength))
+    while(m_nFFTSize < (m_nBlockSize + m_nTaps - 1))
         m_nFFTSize <<= 1;
     //How many bins is that
     m_nFFTBins = m_nFFTSize / 2 + 1;
@@ -105,6 +105,7 @@ bool CAmbisonicShelfFilters::Configure(unsigned nOrder, bool b3D, unsigned nBloc
         for(unsigned i = 0; i < m_nTaps; i++)
             if(m_b3D){
                 switch(m_nOrder){
+                    case 0: pfPsychIR[i_m][i] = i == 0 ? 1.f : 0.f; break;
                     case 1: pfPsychIR[i_m][i] = 2.f*first_order_3D[i_m][i] / 32767.f; break;
                     case 2: pfPsychIR[i_m][i] = 2.f*second_order_3D[i_m][i] / 32767.f; break;
                     case 3: pfPsychIR[i_m][i] = 2.f*third_order_3D[i_m][i] / 32767.f; break;
@@ -112,6 +113,7 @@ bool CAmbisonicShelfFilters::Configure(unsigned nOrder, bool b3D, unsigned nBloc
                 }
                 else{
                     switch(m_nOrder){
+                    case 0: pfPsychIR[i_m][i] = i == 0 ? 1.f : 0.f; break;
                     case 1: pfPsychIR[i_m][i] = 2.f*first_order_2D[i_m][i] / 32767.f; break;
                     case 2: pfPsychIR[i_m][i] = 2.f*second_order_2D[i_m][i] / 32767.f; break;
                     case 3: pfPsychIR[i_m][i] = 2.f*third_order_2D[i_m][i] / 32767.f; break;
@@ -138,6 +140,11 @@ void CAmbisonicShelfFilters::Refresh()
 
 void CAmbisonicShelfFilters::Process(CBFormat* pBFSrcDst)
 {
+    Process(pBFSrcDst, m_nBlockSize);
+}
+
+void CAmbisonicShelfFilters::Process(CBFormat* pBFSrcDst, unsigned int nSamples)
+{
     kiss_fft_cpx cpTemp;
 
     unsigned iChannelOrder = 0;
@@ -152,8 +159,8 @@ void CAmbisonicShelfFilters::Process(CBFormat* pBFSrcDst)
 
         iChannelOrder = int(sqrt(niChannel));    //get the order of the current channel
 
-        memcpy(m_pfScratchBufferA, pBFSrcDst->m_ppfChannels[niChannel], m_nBlockSize * sizeof(float));
-        memset(&m_pfScratchBufferA[m_nBlockSize], 0, (m_nFFTSize - m_nBlockSize) * sizeof(float));
+        memcpy(m_pfScratchBufferA, pBFSrcDst->m_ppfChannels[niChannel], nSamples * sizeof(float));
+        memset(&m_pfScratchBufferA[nSamples], 0, (m_nFFTSize - nSamples) * sizeof(float));
         kiss_fftr(m_pFFT_psych_cfg, m_pfScratchBufferA, m_pcpScratch);
         // Perform the convolution in the frequency domain
         for (unsigned ni = 0; ni < m_nFFTBins; ni++)
@@ -168,11 +175,26 @@ void CAmbisonicShelfFilters::Process(CBFormat* pBFSrcDst)
         kiss_fftri(m_pIFFT_psych_cfg, m_pcpScratch, m_pfScratchBufferA);
         for (unsigned ni = 0; ni < m_nFFTSize; ni++)
             m_pfScratchBufferA[ni] *= m_fFFTScaler;
-        memcpy(pBFSrcDst->m_ppfChannels[niChannel], m_pfScratchBufferA, m_nBlockSize * sizeof(float));
-        for (unsigned ni = 0; ni < m_nOverlapLength; ni++)
+        memcpy(pBFSrcDst->m_ppfChannels[niChannel], m_pfScratchBufferA, nSamples * sizeof(float));
+        unsigned int nOverlapOut = std::min(nSamples, m_nOverlapLength);
+        for (unsigned ni = 0; ni < nOverlapOut; ni++)
         {
             pBFSrcDst->m_ppfChannels[niChannel][ni] += m_pfOverlap[niChannel][ni];
         }
-        memcpy(m_pfOverlap[niChannel], &m_pfScratchBufferA[m_nBlockSize], m_nOverlapLength * sizeof(float));
+        int nOverlapRetain = m_nOverlapLength - nOverlapOut;
+        if (nOverlapRetain > 0)
+        {
+            memcpy(m_pfOverlap[niChannel], &m_pfOverlap[niChannel][nOverlapOut], nOverlapRetain * sizeof(float));
+            // clear the rest of the overlap buffer
+            memset(&m_pfOverlap[niChannel][nOverlapRetain], 0, nOverlapOut * sizeof(float));
+            // Add the new overlap to the old buffer
+            for (unsigned ni = 0; ni < m_nOverlapLength; ni++) {
+                m_pfOverlap[niChannel][ni] += m_pfScratchBufferA[nSamples + ni];
+            }
+        }
+        else
+        {
+            memcpy(m_pfOverlap[niChannel], &m_pfScratchBufferA[nSamples], m_nOverlapLength * sizeof(float));
+        }
     }
 }

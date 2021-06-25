@@ -40,7 +40,9 @@ bool CAmbisonicBinauralizer::Configure(unsigned nOrder,
                                        unsigned& tailLength,
                                        std::string HRTFPath)
 {
-    shelfFilters.Configure(nOrder, b3D, nBlockSize, 0);
+    bool bShelfConfig = shelfFilters.Configure(nOrder, b3D, nBlockSize, 0);
+    if (!bShelfConfig)
+        return false;
 
     //Iterators
     unsigned niEar = 0;
@@ -56,10 +58,10 @@ bool CAmbisonicBinauralizer::Configure(unsigned nOrder,
     m_nBlockSize = nBlockSize;
 
     //What will the overlap size be?
-    m_nOverlapLength = m_nBlockSize < m_nTaps ? m_nBlockSize - 1 : m_nTaps - 1;
+    m_nOverlapLength = m_nTaps - 1;
     //How large does the FFT need to be
     m_nFFTSize = 1;
-    while(m_nFFTSize < (m_nBlockSize + m_nTaps + m_nOverlapLength))
+    while(m_nFFTSize < (m_nBlockSize + m_nTaps - 1))
         m_nFFTSize <<= 1;
     //How many bins is that
     m_nFFTBins = m_nFFTSize / 2 + 1;
@@ -201,7 +203,13 @@ void CAmbisonicBinauralizer::Refresh()
 }
 
 void CAmbisonicBinauralizer::Process(CBFormat* pBFSrc,
-                                     float** ppfDst)
+    float** ppfDst)
+{
+    Process(pBFSrc, ppfDst, m_nBlockSize);
+}
+
+void CAmbisonicBinauralizer::Process(CBFormat* pBFSrc,
+                                     float** ppfDst, unsigned int nSamples)
 {
     unsigned niEar = 0;
     unsigned niChannel = 0;
@@ -209,7 +217,7 @@ void CAmbisonicBinauralizer::Process(CBFormat* pBFSrc,
     kiss_fft_cpx cpTemp;
 
     // Apply psychoacoustic optimisation filters
-    shelfFilters.Process(pBFSrc);
+    shelfFilters.Process(pBFSrc, nSamples);
 
     /* If CPU load needs to be reduced then perform the convolution for each of the Ambisonics/spherical harmonic
     decompositions of the loudspeakers HRTFs for the left ear. For the left ear the results of these convolutions
@@ -233,8 +241,9 @@ void CAmbisonicBinauralizer::Process(CBFormat* pBFSrc,
         memset(m_pfScratchBufferC.data(), 0, m_nFFTSize * sizeof(float));
         for(niChannel = 0; niChannel < m_nChannelCount; niChannel++)
         {
-            memcpy(m_pfScratchBufferB.data(), pBFSrc->m_ppfChannels[niChannel], m_nBlockSize * sizeof(float));
-            memset(&m_pfScratchBufferB[m_nBlockSize], 0, (m_nFFTSize - m_nBlockSize) * sizeof(float));
+
+            memcpy(m_pfScratchBufferB.data(), pBFSrc->m_ppfChannels[niChannel], nSamples * sizeof(float));
+            memset(&m_pfScratchBufferB[nSamples], 0, (m_nFFTSize - nSamples) * sizeof(float));
             kiss_fftr(m_pFFT_cfg.get(), m_pfScratchBufferB.data(), m_pcpScratch.get());
             for(ni = 0; ni < m_nFFTBins; ni++)
             {
@@ -247,7 +256,6 @@ void CAmbisonicBinauralizer::Process(CBFormat* pBFSrc,
             kiss_fftri(m_pIFFT_cfg.get(), m_pcpScratch.get(), m_pfScratchBufferB.data());
             for(ni = 0; ni < m_nFFTSize; ni++)
                 m_pfScratchBufferA[ni] += m_pfScratchBufferB[ni];
-
             for(ni = 0; ni < m_nFFTSize; ni++){
                 // Subtract certain channels (such as Y) to generate right ear.
                 if((niChannel==1) || (niChannel==4) || (niChannel==5) ||
@@ -264,14 +272,32 @@ void CAmbisonicBinauralizer::Process(CBFormat* pBFSrc,
             m_pfScratchBufferA[ni] *= m_fFFTScaler;
             m_pfScratchBufferC[ni] *= m_fFFTScaler;
         }
-        memcpy(ppfDst[0], m_pfScratchBufferA.data(), m_nBlockSize * sizeof(float));
-        memcpy(ppfDst[1], m_pfScratchBufferC.data(), m_nBlockSize * sizeof(float));
-        for(ni = 0; ni < m_nOverlapLength; ni++){
+        memcpy(ppfDst[0], m_pfScratchBufferA.data(), nSamples * sizeof(float));
+        memcpy(ppfDst[1], m_pfScratchBufferC.data(), nSamples * sizeof(float));
+        unsigned int nOverlapOut = std::min(nSamples, m_nOverlapLength);
+        for(ni = 0; ni < nOverlapOut; ni++){
             ppfDst[0][ni] += m_pfOverlap[0][ni];
             ppfDst[1][ni] += m_pfOverlap[1][ni];
         }
-        memcpy(m_pfOverlap[0].data(), &m_pfScratchBufferA[m_nBlockSize], m_nOverlapLength * sizeof(float));
-        memcpy(m_pfOverlap[1].data(), &m_pfScratchBufferC[m_nBlockSize], m_nOverlapLength * sizeof(float));
+        int nOverlapRetain = m_nOverlapLength - nOverlapOut;
+        if (nOverlapRetain > 0)
+        {
+            memcpy(m_pfOverlap[0].data(), &m_pfOverlap[0][nOverlapOut], nOverlapRetain * sizeof(float));
+            memcpy(m_pfOverlap[1].data(), &m_pfOverlap[1][nOverlapOut], nOverlapRetain * sizeof(float));
+            // clear the rest of the overlap buffer
+            memset(&m_pfOverlap[0][nOverlapRetain], 0, nOverlapOut * sizeof(float));
+            memset(&m_pfOverlap[1][nOverlapRetain], 0, nOverlapOut * sizeof(float));
+            // Add the new overlap to the old buffer
+            for (ni = 0; ni < m_nOverlapLength; ni++) {
+                m_pfOverlap[0][ni] += m_pfScratchBufferA[nSamples + ni];
+                m_pfOverlap[1][ni] += m_pfScratchBufferC[nSamples + ni];
+            }
+        }
+        else
+        {
+            memcpy(m_pfOverlap[0].data(), &m_pfScratchBufferA[nSamples], m_nOverlapLength * sizeof(float));
+            memcpy(m_pfOverlap[1].data(), &m_pfScratchBufferC[nSamples], m_nOverlapLength * sizeof(float));
+        }
     }
     else
     {
@@ -282,8 +308,8 @@ void CAmbisonicBinauralizer::Process(CBFormat* pBFSrc,
             memset(m_pfScratchBufferA.data(), 0, m_nFFTSize * sizeof(float));
             for(niChannel = 0; niChannel < m_nChannelCount; niChannel++)
             {
-                memcpy(m_pfScratchBufferB.data(), pBFSrc->m_ppfChannels[niChannel], m_nBlockSize * sizeof(float));
-                memset(&m_pfScratchBufferB[m_nBlockSize], 0, (m_nFFTSize - m_nBlockSize) * sizeof(float));
+                memcpy(m_pfScratchBufferB.data(), pBFSrc->m_ppfChannels[niChannel], nSamples * sizeof(float));
+                memset(&m_pfScratchBufferB[nSamples], 0, (m_nFFTSize - nSamples) * sizeof(float));
                 kiss_fftr(m_pFFT_cfg.get(), m_pfScratchBufferB.data(), m_pcpScratch.get());
                 for(ni = 0; ni < m_nFFTBins; ni++)
                 {
@@ -299,10 +325,27 @@ void CAmbisonicBinauralizer::Process(CBFormat* pBFSrc,
             }
             for(ni = 0; ni < m_nFFTSize; ni++)
                 m_pfScratchBufferA[ni] *= m_fFFTScaler;
-            memcpy(ppfDst[niEar], m_pfScratchBufferA.data(), m_nBlockSize * sizeof(float));
-            for(ni = 0; ni < m_nOverlapLength; ni++)
+            memcpy(ppfDst[niEar], m_pfScratchBufferA.data(), nSamples * sizeof(float));
+            unsigned int nOverlapOut = std::min(nSamples, m_nOverlapLength);
+            for (ni = 0; ni < nOverlapOut; ni++)
+            {
                 ppfDst[niEar][ni] += m_pfOverlap[niEar][ni];
-            memcpy(m_pfOverlap[niEar].data(), &m_pfScratchBufferA[m_nBlockSize], m_nOverlapLength * sizeof(float));
+            }
+            int nOverlapRetain = m_nOverlapLength - nOverlapOut;
+            if (nOverlapRetain > 0)
+            {
+                memcpy(m_pfOverlap[niEar].data(), &m_pfOverlap[niEar][nOverlapOut], nOverlapRetain * sizeof(float));
+                // clear the rest of the overlap buffer
+                memset(&m_pfOverlap[niEar][nOverlapRetain], 0, nOverlapOut * sizeof(float));
+                // Add the new overlap to the old buffer
+                for (ni = 0; ni < m_nOverlapLength; ni++) {
+                    m_pfOverlap[niEar][ni] += m_pfScratchBufferA[nSamples + ni];
+                }
+            }
+            else
+            {
+                memcpy(m_pfOverlap[niEar].data(), &m_pfScratchBufferA[nSamples], m_nOverlapLength * sizeof(float));
+            }
         }
     }
 }
@@ -314,7 +357,7 @@ void CAmbisonicBinauralizer::ArrangeSpeakers()
     unsigned nSpeakers = OrderToSpeakers(m_nOrder, m_b3D);
     //Custom speaker setup
     // Select cube layout for first order a dodecahedron for 2nd and 3rd
-    if (m_nOrder == 1)
+    if (m_nOrder <= 1)
     {
         std::cout << "Getting first order cube" << std::endl;
         nSpeakerSetUp = kAmblib_Cube2;
@@ -325,7 +368,7 @@ void CAmbisonicBinauralizer::ArrangeSpeakers()
         nSpeakerSetUp = kAmblib_Dodecahedron;
     }
 
-    m_AmbDecoder.Configure(m_nOrder, m_b3D, nSpeakerSetUp, nSpeakers);
+    m_AmbDecoder.Configure(m_nOrder, m_b3D, m_nBlockSize, nSpeakerSetUp, nSpeakers);
 
     //Calculate all the speaker coefficients
     m_AmbDecoder.Refresh();
